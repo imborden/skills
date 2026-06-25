@@ -93,15 +93,6 @@ Tasks run one at a time. The orchestrator reviews each diff (two-stage: matches 
 
 `[adversarial]` does NOT compose with `[pipeline]` — adversarial rewrites would invalidate downstream task inputs.
 
-### Decision table
-
-| Situation | Use |
-|-----------|-----|
-| Tasks are independent, want max speed | `[parallel]` |
-| Tasks form a chain, output feeds input | `[pipeline]` |
-| Tasks are sequential but loosely coupled | `[sequential]` (or omit) |
-| Task is safety-critical (auth, payments, data) | Add `[adversarial]` |
-
 ### Gate field references
 
 Gate conditions can reference schema fields from task outputs:
@@ -114,18 +105,9 @@ The orchestrator resolves field names from each task's validated schema output. 
 
 ## Adversarial loop
 
-The `[adversarial]` annotation wraps each task in a generate → critique → regenerate loop. A dedicated critic agent finds failure modes; findings with confidence ≥ threshold bounce the generator for a targeted retry.
+The `[adversarial]` annotation wraps each task in a generate → critique → regenerate loop: the orchestrator dispatches a fresh critic per task, and any finding at or above the threshold bounces the generator for a targeted retry (up to max iterations; unresolved findings are surfaced to the human in the plan doc). It composes with `[parallel]` and `[sequential]` — e.g. `## Phase 2 — Auth [adversarial] [parallel]` — but **not** `[pipeline]`, where adversarial rewrites would invalidate downstream task inputs.
 
-### How it works
-
-```
-Dispatch generator → Generator returns output → Dispatch critic → Critic returns findings with confidence → Gate check:
-  - Any finding ≥ threshold → bounce generator with findings as context → re-dispatch generator
-  - All findings < threshold → pass
-  - Max iterations reached with unresolved findings → stop, surface to human in plan doc
-```
-
-### Phase template additions
+**The critic's operating contract — the loop, the confidence model, the return-JSON schema, and the prompt body — lives in [`adversarial-critic-prompt.md`](adversarial-critic-prompt.md).** Pass that card to the critic when you dispatch it; it receives only the task spec, the generator's output, and the changed files — never the full plan doc (prevents plan-confirmation bias).
 
 Adversarial phases add three fields after the `**Gate:**`:
 
@@ -139,103 +121,25 @@ Adversarial phases add three fields after the `**Gate:**`:
 
 | Field | Purpose | Default |
 |-------|---------|---------|
-| `**Critic:**` | Agent definition for adversarial review | `ce-adversarial-reviewer` |
-| `**Threshold:**` | Minimum confidence for a finding to block the gate | `75` |
-| `**Max iterations:**` | Maximum generate→critique→regenerate cycles per task | `3` |
+| `**Critic:**` | Agent (or prompt card) for adversarial review | `ce-adversarial-reviewer` |
+| `**Threshold:**` | Min confidence for a finding to block the gate (100 = mechanically constructible → block; 75 = concrete/reproducible → block; 50 = note, don't block; <25 = suppress) | `75` |
+| `**Max iterations:**` | Max generate→critique→regenerate cycles per task | `3` |
 
-### Confidence thresholds
-
-| Score | Meaning | Action |
-|-------|---------|--------|
-| 100 | Mechanically constructible — every step verifiable from the diff | Block — bounce generator |
-| 75 | Concrete, reproducible scenario — one step may depend on unconfirmed conditions | Block — bounce generator |
-| 50 | Plausible but one step can't be confirmed from code alone | Note in plan doc, do not block |
-| <25 | Speculative — requires conditions with no evidence | Suppress |
-
-### Critic behavior
-
-The critic receives the task description, the generator's schema output, and the changed file paths. It does NOT receive the full plan doc — prevents plan-confirmation bias.
-
-The critic returns structured output:
-```json
-{
-  "findings": [
-    {
-      "failureScenario": "string",
-      "confidence": 75,
-      "trace": "string",
-      "category": "assumption-violation | composition-failure | cascade | abuse-case"
-    }
-  ],
-  "highestConfidence": 75,
-  "passedThreshold": false
-}
-```
-
-### When to use
-
-**Use `[adversarial]` when** the task touches auth, payments, data mutations, database migrations, external API contracts, PII, or production infrastructure config.
-
-**Skip `[adversarial]` when** the task is UI layout, copy changes, docs, or a mechanical `[haiku]` edit with exact content specified.
-
-### Token cost
-
-Each iteration costs one generator + one critic call. At 3 max iterations, worst case is 6 agent dispatches per task. Weigh against the cost of a bug: for a migration, 6 calls is cheap; for a README update, it's overhead.
+**Use `[adversarial]` when** the task touches auth, payments, data mutations, migrations, external API contracts, PII, or production infra. **Skip it** for UI layout, copy, docs, or mechanical `[haiku]` edits with exact content — the token cost (worst case 6 dispatches/task) isn't justified.
 
 ## Schema validation
 
-Each task can declare a JSON Schema that the agent's output must conform to. The orchestrator passes this as the `schema` option when dispatching the agent.
+Each task MAY declare a flat JSON Schema its output must conform to (`**Schema:** { "filesCreated": ["string"], "testsPassing": "boolean" }`) — structured returns let the orchestrator check fields mechanically instead of judging prose. Keep schemas flat (max 2 levels), names descriptive (`filesCreated` not `fc`), include a count field when it helps (`endpointsSecured: "integer"`), and use `boolean` for pass/fail signals; `"string"`, `"boolean"`, `"integer"`, and string arrays cover ~90% of tasks. Skip schema when the output is genuinely hard to schematize (narrative or quality-only work) or manual diff review suffices.
 
-**Note:** Schema enforcement at the tool layer requires the `Workflow` tool's `agent(prompt, {schema: ...})` function. When dispatching via the `Agent` tool directly, the schema serves as a contract for manual validation — the orchestrator checks the agent's output against the schema fields. The plan format is identical either way.
+Gate conditions may reference schema fields by name (see "Gate field references" above); a gate referencing a field no task declares is a plan error to fix before dispatch. Enforcement is automatic with the `Workflow` tool's `agent(prompt, {schema})`; via the `Agent` tool directly the schema is a manual-validation contract — same plan format either way.
 
-### Schema syntax
-
-```markdown
-### Task N — <name> [sonnet]
-**Files:** Create `src/middleware/auth.ts`
-**Schema:** `{ "filesCreated": ["string"], "testsPassing": "boolean", "endpointsSecured": "integer" }`
-```
-
-### Schema design rules
-
-1. **Keep it flat.** Maximum 2 levels of nesting. Deeply nested objects break agent reliability.
-2. **Use descriptive field names.** `filesCreated` not `fc`, `testsPassing` not `tp`.
-3. **Include a count field when relevant.** `endpointsSecured: "integer"` tells you it happened and how many times.
-4. **Boolean for pass/fail.** `dryRunPassed: "boolean"` is the simplest gate signal.
-5. **Use the simplest types that work.** `"string"`, `"boolean"`, `"integer"`, and arrays of strings cover 90% of tasks.
-6. **Skip schema when** the output is hard to schematize (narrative improvements, code quality-only tasks) or manual diff review is sufficient.
-
-### Schema in gates
-
-See "Gate field references" in Phase execution strategies above for syntax and orchestrator behavior.
-
-### Task `**Receives:**` field
-
-In `[pipeline]` phases, each task (except the first) MUST declare what it receives from the previous task:
+**Receives (pipeline tasks):** in `[pipeline]` phases every task except the first MUST declare what it receives from the previous task via a `**Receives:**` field; the orchestrator injects that output as context for the next agent automatically.
 
 ```markdown
 ### Task 4 — Write migration [sonnet]
 **Receives:** Task 3 output — `{ "typesFile": "src/types/db.ts", "entities": ["User"] }`
 **Schema:** `{ "migrationFile": "string", "rollbackFile": "string", "dryRunPassed": "boolean" }`
 ```
-
-The orchestrator injects the previous task's output into the next agent's context automatically.
-
-## Orchestrator rules (state these in the plan + handoff)
-
-- The orchestrator **directs subagents and validates gates — it does NOT write feature code itself.** Exception: it writes files whose exact content is in the plan (scaffolding, config, fixtures) directly rather than dispatching them.
-- Between tasks it **reviews the diff in two stages**: (1) does it match the plan? (2) does it actually work?
-- **Proof bar:** nothing is "done" without pasted real output. If a planned decision is unverified, gate it with a live probe instead of trusting it.
-- **On surprises (the handoff states the boundary):** doc-backed corrections to a planned decision → fix, document in the plan, continue. Anything that adds a dependency, costs money, or changes scope → STOP and ask.
-- It **marks tasks complete in the plan MD**: flip `- [ ]` → `- [x]` as each task passes; add a one-line result under each gate. **Commit per task** with the exact message specified. **Batch the bookkeeping** — flip a phase's checkboxes in one pass and commit doc updates per phase, not one edit/commit per box.
-- When **all gates pass**, it **moves the file** `docs/plans/incomplete/<file>` → `docs/plans/complete/<file>` (e.g. `git mv`), as the signal the build is done.
-- On gate failure, bounce the specific task to a fresh agent with the failure output — don't paper over it.
-- **Phase annotations:** `[parallel]` → dispatch all tasks simultaneously. `[pipeline]` → dispatch sequentially, feed each output to the next via `**Receives:**`. `[sequential]` → one at a time with manual diff review between tasks. Omitted annotation defaults to `[sequential]`.
-- **Adversarial phases:** For `[adversarial]` phases, run the generator→critic→regenerate loop per task up to `**Max iterations:**`. Block on findings at or above `**Threshold:**`. Surface unresolved findings to the human.
-- **Schema handling:** When a task has `**Schema:**`, pass it when dispatching the agent. Validate output against schema fields. When a task has no schema, fall back to manual diff review.
-- **Gate field references:** Resolve schema field names in gate conditions (`testsPassing === true`). If a referenced field is absent from any task's schema, flag a plan error before dispatching.
-- **Pipeline handoff:** In `[pipeline]` phases, the `**Receives:**` field tells you which previous task's output to inject. Pass the named schema fields as context to the next agent.
-- **Task verification:** The `**Verify:**` field on each task is a post-implementation smoke test the orchestrator runs before marking the task done — distinct from the phase gate (which gates the phase boundary). Run the verify command after review and before commit.
 
 ## Quick Reference
 
@@ -281,12 +185,7 @@ The orchestrator injects the previous task's output into the next agent's contex
 ## Red Flags — STOP
 
 - About to write code / dispatch a coding agent from the authoring session → STOP, you only plan.
-- A haiku task that says "implement X" without exact files/commands → rewrite it explicitly or make it `[sonnet]`.
-- A phase with no runnable gate command → add one.
 - The riskiest assumption sits unprobed until a late phase → pull a cheap live probe of it into the earliest phase that can run it.
-- A `[parallel]` phase where one task references another task's output → split into separate phases or switch to `[pipeline]`.
-- A `[pipeline]` phase with `[adversarial]` → adversarial rewrites break the pipeline chain. Use `[adversarial] [parallel]` or separate the adversarial phase from the pipeline.
-- A `[pipeline]` task without `**Receives:**` → add it or the orchestrator won't know what to pass forward.
-- A schema with 3+ levels of nesting → flatten to max 2. The agent will fail StructuredOutput on deep objects.
-- A gate referencing a schema field that doesn't exist in any task → the orchestrator will flag this as a plan error. Fix the gate or add the field.
-- Plan saved outside `docs/plans/incomplete/` → move it.
+- A phase with no runnable gate command → add one.
+
+The pipeline/parallel/schema/adversarial tripwires live in **Common Mistakes** above — these three are the stop-now subset.

@@ -132,8 +132,10 @@ How to confirm the whole thing works: commands to run, what to observe, tests to
 > `[parallel]` dispatch all tasks at once, `[pipeline]` dispatch sequentially with
 > output feeding the next task, `[sequential]` (default) one at a time with manual
 > review between. `[adversarial]` composes with `[parallel]` or `[sequential]` for
-> generator→critic→regenerate loops — run up to `**Max iterations:**`, block on
-> findings at or above `**Threshold:**`.
+> generator→critic→regenerate loops — dispatch the critic per task with
+> `adversarial-critic-prompt.md` (give it the task spec + generator output + changed
+> files, not the full plan), run up to `**Max iterations:**`, and block on findings at
+> or above `**Threshold:**`.
 >
 > Tasks with `**Schema:**` expect structured JSON output — pass the schema when
 > dispatching the agent and validate against it. Gate conditions may reference
@@ -143,11 +145,13 @@ How to confirm the whole thing works: commands to run, what to observe, tests to
 > You own the gates and do **not** write feature code yourself: dispatch one fresh
 > agent per task at its tagged tier (`[haiku]` mechanical, `[sonnet]` judgment),
 > giving each agent only its task's section. Between tasks, review the diff (matches
-> plan? actually works?). At each phase boundary, run the gate command yourself and
-> inspect real output; mark the phase done only when it passes. Flip
-> `- [ ]`→`- [x]` per task and commit per task with the message in the task. When
-> every gate passes, `git mv` this file to `docs/plans/complete/`. On failure,
-> bounce that task to a fresh agent with the failure output.
+> plan? actually works?), then run the task's `**Verify:**` command — a per-task smoke
+> test, distinct from the phase gate — before committing. At each phase boundary, run
+> the gate command yourself and inspect real output; mark the phase done only when it
+> passes. Flip `- [ ]`→`- [x]` and commit per task with the message in the task,
+> batching the checkbox bookkeeping per phase (one pass, not one commit per box). When
+> every gate passes, `git mv` this file to `docs/plans/complete/`. On failure, bounce
+> that task to a fresh agent with the failure output.
 >
 > **Hard rules:** <project-specific invariants the agents must not violate>.
 >
